@@ -1,0 +1,561 @@
+---
+title: "RADICL-Seq enhancer analysis"
+author: "Andrew T. Kwon"
+date: "June 30, 2020"
+output: 
+  html_document: 
+    number_sections: yes
+    toc: yes
+---
+
+```{r echo=FALSE}
+knitr::opts_chunk$set(cache =TRUE, cache.lazy=FALSE)
+knitr::opts_knit$set(results='hide', warning=FALSE, error=FALSE)
+```
+
+# Major goals
+
+1. De novo Enhancer calling from CAGE data
+ + identify de novo enhancers from mESC and mOPC CAGE data based on bidirecitonal expression
+
+2. Comparison of RADICL-seq DNA regions and enhancers
+ + Identify which enhancers overlap the DNA regions of RADICL-seq significant interaction set
+ + For those overlapping enhancers / DNA regions, identify which RNA regions interact
+ + characterize the enhancers and RNA regions supported by RADICL-seq and CAGE data
+
+# Set Up
+
+We will be using the CAGEfightR package to analyze the CAGE data and identify de novo enhancers. RNA-DNA interactions from RADICL-seq data will be processed using the InteractionSet package.
+
+## Library loading
+
+```{r library_load, message=FALSE}
+# Load the required libraries
+library(CAGEfightR)
+library(GenomicFeatures)
+library(InteractionSet)
+library(tidyverse) # prefer to have this mask the functions in other packages
+library(UpSetR)
+```
+
+For this analysis, each RNA/DNA RADICL-seq position will be extended by 1000 bp on either side.
+For genome annotation, we will use Gencode VM14 (mm10) as used in the RADICL-seq manuscript. 
+
+```{r parameter_set}
+#
+# parameters
+#
+
+# RADICL-seq region flanking width
+flank=1000
+
+# gencode version used (what was used in the original analysis)
+gencode_ver <- 14 
+
+#
+# set the relevant paths
+#
+
+dirs <- list()
+
+# project directories
+dirs$base <- "~/Projects/Molecular_Network/RADICL-seq"
+dirs$data <- file.path(dirs$base, "data")
+dirs$box <- "~/Box Sync/Projects/Molecular_Network/RADICL-seq"
+
+# annotation data directories
+dirs$gencode <- paste0("~/Projects/Data/Gencode/annotation/mus_musculus/gencode-", gencode_ver)
+```
+
+## Helper Function: CTSS to BigWig
+
+In order to use CAGEfightR's CTSS processing functionalities, we first need to convert CTSS files into bigWig files.
+
+```{r convert_ctss_to_bigwig}
+#' Convers CTSS bed file to  BigWig
+#'
+#' @param ctss_file path to ctss.bed file
+#' @param genomeInfo genome info file created e.g. by "rtracklayer::SeqinfoForUCSCGenome("hg38")"
+#' @return The function writes two files, one for each strand, (".plus.bw" and ".minus.bw"), in the same directory as the original file
+#' @importFrom GenomicRanges GRanges
+#' @importFrom rtracklayer import export
+#' @export
+convert_ctss_to_bigwig = function( ctss_file, n, genomeInfo ) {
+  bed = rtracklayer::import(ctss_file)
+  bed = GenomicRanges::GRanges(bed , seqinfo =  genomeInfo)
+  bed_plus  = bed[ bed@strand == "+", ]
+  bed_minus = bed[ bed@strand == "-", ]
+  file <- file.path(dirname(ctss_file), paste0(n, '.plus.bw'))
+  rtracklayer::export(object = bed_plus , file  , format = "BigWig" )
+  file <- file.path(dirname(ctss_file), paste0(n, '.minus.bw'))
+  rtracklayer::export(object = bed_minus, file  , format = "BigWig" )
+}
+```
+
+
+## Data Loading
+
+We have to load:
+* genome annotation
+* RADICL-seq significant interaction pairs
+* CAGE expression data
+
+### Gene annotation loading
+
+We need to load the genome information and GENCODE annotation and set them up as GenomicFeatures object to be used in conjunction with RangeSummarizedExperiments.
+
+```{r load_annotations}
+genomeInfo <- SeqinfoForUCSCGenome('mm10')
+genomeInfo <- genomeInfo[c(paste0('chr', 1:19), 'chrX', 'chrY', 'chrM')]
+
+# GTF format
+# Level: 1 (verified loci), 2 (manually annotated loci), 3 (automatically annotated loci)
+gencode <- rtracklayer::import(file.path(dirs$gencode, 'gencode.vM14.annotation.gtf.gz'))
+```
+
+Since the txdb object is set dynamically, this needs to be re-run in any new instance.
+```{r txdb}
+txdb <- GenomicFeatures::makeTxDbFromGFF(file.path(dirs$gencode, "gencode.vM14.annotation.gtf.gz"),
+                                         format='auto',
+                                         dataSource='Gencode vM14', organism='Mus musculus',
+                                         chrominfo=genomeInfo
+)
+```
+
+
+### RADICL-seq regions
+
+The GEO series ID of the RADICL-seq data files used in this analysis is GSE132190.
+
+The data consists of the following conditions:
+
+1. Treatments
+  + 1FA vs 2FA: 1% or 2% formaldehyde
+  - test diff concentrations of crosslinking agent
+  + ActD: inhibitor of RNA pol II elongation
+  - test RNA-chromatin stability in presence of transcription blockade
+  + NPM: Non-protein mediated. digest with proteinase K to reverse FA crosslinking right before RNA elongation.
+  - only keep direct RNA-DNA interactions, not protein-mediated
+
+2. The important data columns in these tables are:
+* col1: chromosome of origin for the RNA
+* col2: midpoint location for the RNA read
+* col3: midpoint location for the RNA read (duplication)
+* col4: not relevant
+* col5: not relevant
+* col6: sense of transcription (- refers to negative strand. + is positive strand).
+* col7: Ensembl ID of the RNA
+* col8: RNA class
+* col9: RNA class (duplication)
+* col10: RNA feature
+* col11: chromosome for interacting DNA read
+* col12: midpoint location for the DNA read
+* col13: midpoint location for the DNA read (duplication)
+* col14: DNA identifier (chromosome_bin; genome has been divided in 25-kb bins).
+* col15: not relevant
+* col16: dataset
+* col17: p-value before correction
+* col18: p-value after correction
+* Rest of columns: not relevant
+
+```{r load_radicl_seq, message=FALSE, warning=FALSE, error=FALSE}
+header <- c('cell_type', 'treatment', 'chrom.R', 'RNA_pos', 'strand.R', 'gene_id.R', 'gene_class.R', 'feature_type.R', 'chrom.D', 'pos.D', 'chromosome_bin', 'pvalue', 'FDR')
+
+input_files <- list.files(file.path(dirs$data, "RADICL-seq"), 'gz', full.names=TRUE)
+input_files <- input_files[grep('1FA', input_files)]
+n <- gsub('GSE132190_', '', basename(input_files))
+n <- gsub('_significant.txt.gz', '', n)
+names(input_files) <- n
+radicl <- invisible(map(names(input_files), function(filename) {
+  tab <- read_tsv(input_files[filename], col_names=FALSE)
+  tab <- tab[,-c(3:5,9,13,15,19:32)]
+  terms <- unlist(strsplit(filename, split="_"))
+  tab$cell_type <- terms[1]
+  tab$treatment <- terms[2]
+  tab <- tab[,c(13:14,1:9,11:12)]
+  colnames(tab) <- header
+  tab
+}))
+names(radicl) <- n
+
+radicl_set <- map(radicl, function(tab) {
+  rna <- GRanges(seqnames=tab$chrom.R, 
+                 ranges=IRanges(start=tab$RNA_pos - flank, end=tab$RNA_pos + flank), 
+                 strand=tab$strand.R, 
+                 seqinfo=genomeInfo) %>% trim()
+  
+  dna <- GRanges(seqnames=tab$chrom.D, 
+                 ranges=IRanges(start=tab$pos.D - flank, end=tab$pos.D + flank), 
+                 seqinfo=genomeInfo) %>% trim()
+  
+  interaction <- GInteractions(rna, dna)
+  mcols(interaction) <- tab
+  
+  interaction
+})
+
+rm(n, input_files, radicl)
+```
+
+### CAGE Data
+
+Load the CTSS files from the bulk CAGE data and produce the sample annotation table. The files are available on GEO: GSE132191
+
+#### Sample annotation table
+
+We produce the sample annotation table, using the attributes encoded into the CTSS file names themselves.
+We only have 2 libraries, coinciding with the cell type. We can ignore the info.
+
+CThi10297
+- mOPC: 5' SOLX_Mix_02 - CTT
+- mOPC:	5' SOLX_Mix_05 - ACT
+- mOPC:	5' SOLX_Mix_09 - ATG
+
+CThi10298
+- mESC:	5' SOLX_Mix_05 - ACT
+- mESC:	5' SOLX_Mix_09 - ATG
+- mESC:	5' SOLX_Mix_02 - CTT
+
+```{r setup_input_files_and_sample_info_bulk}
+input_files <- list.files(file.path(dirs$data, "CAGE"), 'bed', full.names=TRUE)
+
+# parse the input file names to get sample information
+cell_type <- unlist(lapply(strsplit(basename(input_files), split="_"), '[[', 2))
+
+# CAGE sample information table
+# regular data frame, as tibble causes problems with CAGEfightR
+sample_info <- data.frame(sample=paste(cell_type, rep(1:3, 2), sep="_"), 
+					  #library.id=lib_ids[sample_names],
+					  #barcode=barcodes,
+					  cell_type=factor(cell_type)
+					  )
+rownames(sample_info) <- sample_info$sample
+
+names(input_files) <- sample_info$sample
+
+rm(cell_type)
+```
+
+#### Load the CTSS files
+
+Before we can actually load the data, we first need to convert the CTSS files to bigwig files.
+```{r convert_ctss_to_bigwig_bulk, warning=FALSE, error=FALSE}
+invisible(map(names(input_files), function(n) {
+  convert_ctss_to_bigwig(input_files[n], file.path('bigwig',n), genomeInfo)
+}))
+
+bw_plus <- BigWigFileList(file.path(dirname(input_files), 'bigwig', paste0(names(input_files), '.plus.bw')))
+bw_minus <- BigWigFileList(file.path(dirname(input_files), 'bigwig', paste0(names(input_files), '.minus.bw')))
+names(bw_plus) <- names(input_files)
+names(bw_minus) <- names(input_files)
+```
+
+With the bigwig file conversion complete, we can proceed to load and quantify the CTSSs. We will prepare a separate set of filtered CTSSs based on support (min. expression of 1 in min. 2 samples).
+
+```{r quantify_CTSSs}
+# quantify the CTSSs from the bigwig files, then apply minimal filtering to reduce size
+CTSSs <- quantifyCTSSs(plusStrand=bw_plus,
+                       minusStrand=bw_minus,
+                       design=sample_info,
+                       genome=genomeInfo) %>% 
+  trim() %>%
+  subsetBySupport(inputAssay='counts', outputColumn='support', unexpressed=0, minSamples=1) %>%
+  calcTPM(inputAssay='counts', outputAssay='TPM') %>% 
+  calcPooled(inputAssay='TPM')
+
+# for TSSs, use more restrictive supported CTSS set
+# no need to remove those overlapping bi_TCs yet, because this can be taken care of when we combine TSSs and enhancers
+supported_CTSSs <- subsetBySupport(CTSSs, inputAssay='counts', outputColumn='support', unexpressed=1, minSamples=2) %>%
+  calcTPM() %>%
+  calcPooled()
+
+rm(bw_plus, bw_minus, input_files)
+```
+
+
+# CAGE Cluster Quantification
+
+Using the CTSSs with support, we want to identify de novo unidirectional and bidirectional CAGE clusters. The bidirectional CAGE clusters would represent the enhancer regions. 
+
+## Unidirectional CAGE cluster identification
+
+Unidirectional CAGE clusters would represent the actual sites of TSSs that we can detect with our data. After processing for quality, we can calculate the expression levels of each cluster and annotate them using the pre-loaded annotation DB. For this step, we want to use the combined set of CTSSs to make sure we are including all signal, and that we end up with a common set of CAGE clusters to be quantified for each cell and condition combination.
+
+```{r find_TSSs_bulk}
+# to detect clusters of TSSs
+uni_TCs <- clusterUnidirectionally(supported_CTSSs, pooledCutoff=3, mergeDist=20) %>%
+  trim() %>%
+  assignTxID(txModels=txdb, outputColumn='txID') %>%
+  assignTxType(txModels=txdb, outputColumn='txType') %>%
+  assignTxType(txModels=txdb, outputColumn='peakTxType', swap='thick')
+```
+
+## Bidirectional CAGE cluster identification
+
+For enhancer identification, we want to relax the quality filter, as the expression levels are going to be much lower in general. We can put additional filters after the identification step if needed. Again, we filter the identified bidirectional clusters for annotated promoters / 5' UTRs / exons.
+
+```{r find_enhancers_bulk}
+
+# enhancers / bidirectional
+bi_TCs <- clusterBidirectionally(CTSSs, balanceThreshold=0.9)
+bi_TCs <- calcBidirectionality(bi_TCs, samples=CTSSs)
+
+# annotate and filter
+bi_TCs <- assignTxType(bi_TCs, txModels=txdb, tssUpstream=500, tssDownstream=500, outputColumn='txType')
+bi_TCs <- subset(bi_TCs, !txType %in% c('promoter','fiveUTR','exon')) 
+
+# filter bi_TCs from uni_TCs
+uni_TCs <- uni_TCs[-unique(queryHits(findOverlaps(uni_TCs, bi_TCs)))]
+```
+
+
+## Quantification of CAGE clusters
+
+We now quantify the counts at the prepared de novo and FANTOM5 TSSs and enhancers using the total set of CTSSs.
+
+```{r quantify_TSSs_and_enhancers}
+
+# combine and calculate TPM
+# filter for higher expressed ones and remove exons
+TSSs <- quantifyClusters(CTSSs, clusters=uni_TCs, inputAssay='counts') %>%
+  calcTPM() %>%
+  calcPooled()
+TSSs <- subset(TSSs, score / ncol(TSSs) >= 2 & txType != 'exon')
+
+# quantify the denovo enhancers
+enhancers <- quantifyClusters(CTSSs, clusters=bi_TCs) %>%
+  calcTPM() %>%
+  calcPooled()
+enhancers$totalTags <- NULL
+
+# annotate enhancers
+rowData(enhancers)$clusterType <- 'enhancer'
+rowData(enhancers)$clusterName <- paste0('e1@', names(enhancers))
+rowData(enhancers)$geneID <- paste0('e1@', names(enhancers))
+rowData(enhancers)$geneSymbol <- rowData(enhancers)$geneID
+rowData(enhancers)$geneType <- 'enhancer'
+rowData(enhancers)$txID <- NA
+rowData(enhancers)$IQR <- NA
+rowData(enhancers)$entropy <- NA
+rowData(enhancers)$shape <- NA
+```
+
+We have `r length(enhancer)` de novo enhancers.
+
+```{r interim_cleanup}
+rm(uni_TCs, bi_TCs, supported_CTSSs, gencode)
+```
+
+# Main Analyses
+
+Now all the data has been loaded and processed, we proceed to the main analyses. We will focus on the 1FA treatment samples only.
+
+## RADICL-seq and Enhancers
+
+Here we delve into finding out what we can about enhancers with RADICL-seq data and their interacting RNA hits, including number of interacting partners, their distances, and cell type specificity. 
+
+We first set up for the analysis by overlapping RADICL-seq DNA regions with enhancers.
+
+```{r enhancer_overlap}
+
+# count everything here. situation will depend on cell type
+matching_regs <- invisible(
+  map(names(radicl_set), function(n) {
+    
+    # what I need to do
+    # go from enhancer -> radicl region -> interacting genes
+    
+    # trim to at least some expression
+    rad_rna <- trim(anchors(radicl_set[[n]])$first)
+
+    rad_dna <- trim(anchors(radicl_set[[n]])$second)
+
+    # only include those where both RNA and DNA regions have CTSS support
+    matching_regs <- mcols(radicl_set[[n]]) %>% as_tibble()
+    
+    # now filter for enhancer overlap
+    overlap <- findOverlaps(rad_dna, enhancers)
+    ind <- unique(queryHits(overlap))
+    rad_dna <- rad_dna[ind]
+    rad_rna <- rad_rna[ind]
+    
+    matching_regs$enhancer <- NA
+    matching_regs$enhancer_pos <- NA
+    matching_regs$enhancer[queryHits(overlap)] <- rownames(enhancers)[subjectHits(overlap)]
+    matching_regs$enhancer_pos[queryHits(overlap)] <- round((start(enhancers) + end(enhancers)) / 2)[subjectHits(overlap)]
+    matching_regs <- matching_regs[ind,]
+    
+    merged_rad <- GenomicRanges::reduce(rad_dna)
+    overlap <- findOverlaps(rad_dna, merged_rad)
+    matching_regs$merged_ind <- subjectHits(overlap)
+    matching_regs$merged_pos <- round((start(merged_rad) + end(merged_rad)) / 2)[subjectHits(overlap)]
+    
+    interaction <- GInteractions(rad_rna, merged_rad[subjectHits(overlap)])
+    mcols(interaction) <- matching_regs[subjectHits(overlap),]
+
+    interaction
+}))
+names(matching_regs) <- names(radicl_set)
+
+```
+
+Now, we calculate on average how many enhancers a given RADICL-seq DNA region overlaps, and vice versa. 
+
+```{r calc_enhancers_per_DNA}
+enh_per_dna <- Reduce(bind_rows, map(matching_regs, function(regs) {
+  tab <- mcols(regs)
+  n <- as_tibble(tab) %>% select(enhancer, merged_ind) %>% group_by(merged_ind) %>% summarise(length(unique(enhancer)))
+  res <- table(n[,2])
+  vals <- c(unique(tab$cell_type), as.numeric(res))
+  names(vals) <- c('cell', names(res))
+  vals
+}))
+
+# now sort and fill in the gaps
+res <- enh_per_dna[,2:ncol(enh_per_dna)]
+cn <- as.numeric(colnames(res))
+mat <- matrix(0, nrow=nrow(res), ncol=max(cn))
+mat[,cn] <- as.numeric(as.matrix(res))
+colnames(mat) <- as.character(1:ncol(mat))
+enh_per_dna <- bind_cols(enh_per_dna[,1], as_tibble(mat))
+enh_per_dna[is.na(enh_per_dna)] <- 0
+```
+
+We display the results as dot plots, broken down by treatment. We see that most enhancers overlap just 1 RADICL-seq DNA region, with max. of 2. It should be noted that these numbers are based on merged set of RADICL-seq DNA regions (after filtering for enhancer overlap).
+
+```{r p1_num_per_DNA, fig.width=10, fig.height=7}
+pdf(file.path(dirs$box, "p1_num_per_DNA.pdf"), width=10, height=7)
+tab <- pivot_longer(enh_per_dna, cols=3:ncol(enh_per_dna), names_to='num', values_to='count')
+tab$num <- as.integer(tab$num)
+ggplot(tab, aes(x=num, y=count, colour=cell, shape=cell)) + geom_point(alpha=0.8, size=2) + 
+  xlab("Number of enhancers per DNA region") + ggtitle("Per RADICL-seq DNA region") + theme_bw()
+dev.off()
+```
+
+We then look at the number of interacting RNA hits per enhancer, where the interacting RNA hits are determined by looking at the RADICL-seq DNA region the enhancers overlap. We simplify the picture by restricting ourselves to unique gene annotations associated with the RNA hits.
+
+We tally which RADICL-seq RNA hit regions are supported by CAGE expression. To qualify as expressed, we will set the filter of at least 1 out of 3 replicates for each cell type having at least 1 TPM.
+
+
+```{r RNA_hits_per_enh}
+# prepare separate lists of indices indicating which ones have CAGE support
+expressed_ind <- map(matching_regs, function(regs) {
+  cell_type <- unique(mcols(regs)$cell_type)
+  exp_enh <- assays(enhancers)$TPM
+  exp_enh <- rownames(exp_enh)[rowSums(exp_enh[,cell_ind$cage[[cell_type]]] > 1) > 1]
+  overlap <- findOverlaps(anchors(regs)$second, enhancers[exp_enh])
+  enh_ind <- unique(queryHits(overlap))
+  
+  exp_rna <- assays(TSSs)$TPM
+  exp_rna <- rownames(TSSs)[rowSums(exp_rna[,cell_ind$cage[[cell_type]]] > 1) > 1]
+  overlap <- findOverlaps(anchors(regs)$first, TSSs[exp_rna])
+  tss_ind <- unique(queryHits(overlap))
+  
+  intersect(enh_ind, tss_ind)
+})
+names(expressed_ind) <- names(matching_regs)
+
+# let's go by strict gene IDs
+enh_genes <- map(names(matching_regs), function(sample) {
+  regs <- matching_regs[[sample]]
+  cell_type <- unique(mcols(regs)$cell_type)
+
+  # expressed only
+  expressed <- mcols(regs)[expressed_ind[[sample]],] %>% as_tibble() %>%
+    select(c(enhancer, merged_ind, gene_id.R)) %>% 
+    group_by(enhancer) %>%
+    summarise_at(vars(merged_ind, gene_id.R), function(x) {length(unique(x))})
+  expressed$cell_type <- cell_type
+  
+  expressed
+})
+names(enh_genes) <- names(matching_regs)
+enh_genes <- bind_rows(enh_genes)
+```
+
+We display the results broken down by each cell type. We can see that most enhancers are linked to only 1 gene, although there are some exceptions with higher number. 
+
+* Upon manual check, it appears that most of the higher number of interaction cases are coming from a single enhancer at chr17:39,846,012-39,846,418. This single enhancer is found to contribute to the most number interacitons. Upon manual check of the region at the UCSC genome browser, it appears that this region has ENCODE support as proximal enhancer from embryonic brain and heart samples. 
+
+```{r p2_RNA_hits_per_enh, fig.width=10}
+pdf(file.path(dirs$box, "p2_num_genes_per_enhancer.pdf"), width=10)
+ggplot(enh_genes, aes(x=gene_id.R, colour=cell_type, fill=cell_type)) + 
+  geom_histogram() + xlab("Number of unique genes associated") + 
+  facet_wrap(~cell_type) + theme_bw() +
+  ggtitle("Number of expressed genes linked to each enhancer")
+dev.off()
+```
+
+What are the distance distributions between the enhancers and their interacting RNA hits? What about RADICL-seq DNA regions that do not overlap enhancers? Again, we will calculate the distributions for both the total set of regions and those with expression support. For non-enhancer regions, we will select the regions that do not overlap any of the merged set of de novo and FANTOM5 enhancers.
+
+```{r calc_distance_to_enhancer}
+dist_distrib <- list()
+
+# expressed only
+dist_distrib$enhancer <- bind_rows(
+  map(names(matching_regs), function(sample) {
+    regs <- matching_regs[[sample]]
+    mcols(regs)[expressed_ind[[sample]],] %>% as_tibble() %>%
+      select(cell_type, treatment, merged_ind, RNA_pos, merged_pos) %>% 
+      distinct() %>%
+      mutate(gene_radicl_dist=abs(RNA_pos - merged_pos))
+  }))
+
+nonenh <- map(radicl_set, function(radset) {
+  regs <- anchors(radset)$second
+  overlap <- findOverlaps(regs, enhancers)
+  regs <- regs[-unique(queryHits(overlap))]
+  mcoltab <- mcols(radset)[-unique(queryHits(overlap)),] %>% as_tibble()
+  
+  # merge
+  merged_rad <- GenomicRanges::reduce(regs)
+  overlap <- findOverlaps(merged_rad, regs) # since merged, no duplicates
+  mcoltab$merged_ind <- NA
+  mcoltab$merged_ind[subjectHits(overlap)] <- queryHits(overlap)
+  mcoltab$merged_pos <- NA
+  mcoltab$merged_pos[subjectHits(overlap)] <- round((start(merged_rad) + end(merged_rad)) / 2)[queryHits(overlap)]
+  
+  mcoltab
+})
+
+dist_distrib$non_enhancer <- bind_rows(
+  map(nonenh, function(mcoltab) {
+    mcoltab %>%
+      dplyr::select(cell_type, merged_ind, RNA_pos, merged_pos) %>% 
+      distinct() %>%
+      mutate(gene_radicl_dist=abs(RNA_pos - merged_pos))
+      }))
+
+rm(nonenh)
+
+dist_distrib <- bind_rows(dist_distrib, .id='DNA_type')
+```
+
+Are the enhancer and non-enhancer distance distributions significantly different?
+```{r stat_diff_enhancer_vs_nonehancer_dist_ditrib}
+wilcox.test(dplyr::filter(dist_distrib$enhancer, cell_type == 'mESC')$gene_radicl_dist, 
+            dplyr::filter(dist_distrib$non_enhancer, cell_type == 'mESC')$gene_radicl_dist)
+
+wilcox.test(dplyr::filter(dist_distrib$enhancer, cell_type == 'mOPC')$gene_radicl_dist, 
+            dplyr::filter(dist_distrib$non_enhancer, cell_type == 'mOPC')$gene_radicl_dist)
+```
+
+Non-enhancer RNA-DNA distances are significantly different from enhancer distances.
+
+```{r p3_dist_distributions, fig.width=10}
+pdf(file.path(dirs$box, "p3_RNA_DNA_distance_distribution.pdf"))
+ggplot(dist_distrib, aes(x=DNA_type, y=log10(gene_radicl_dist+1), colour=DNA_type)) +
+  geom_violin() + geom_boxplot(width=0.1) + 
+  facet_wrap(~cell_type) +
+  ylab("RNA-DNA distance (log10 bp)") +
+  ggtitle("RNA-DNA distance distribution") + 
+  theme_bw()
+dev.off()
+```
+
+# Session Information
+
+```{r session_info}
+sessionInfo()
+```
+
